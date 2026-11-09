@@ -1,19 +1,29 @@
 name: Go
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run regexp; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions: read-all
 
 jobs:
   build:
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
         go-version: [1.22.x, 1.23.x, 1.24.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Go 1.22 test binaries abort on macOS 15+ runners (dyld: missing LC_UUID) and the macos-14
+        # image is retired ("configuration 'macos-14-arm64-us-default' is not supported"), so the
+        # Go 1.22 x macOS leg cannot run; macOS is covered by Go 1.23/1.24, Go 1.22 by ubuntu/windows.
+        exclude:
+          - go-version: 1.22.x
+            os: macos-latest
     env:
       CGO_ENABLED: 0
     runs-on: ${{ matrix.os }}
@@ -30,28 +40,98 @@ jobs:
       run: go vet ./...
 
     - name: Test
-      run: go test ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
 
     - name: Test No-asm
-      run: go test -tags=noasm ./...
+      run: go test -tags=noasm ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test No-unsafe
-      run: go test -tags=nounsafe ./...
+      run: go test -tags=nounsafe ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test No-unsafe, noasm
-      run: go test -tags="nounsafe,noasm" ./...
+      run: go test -tags="nounsafe,noasm" ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test Race 1 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=1 -short -race -tags=nounsafe -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=1 -short -race -tags=nounsafe -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race1.log"
 
     - name: Test Race 4 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=4 -short -race -tags=nounsafe -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=4 -short -race -tags=nounsafe -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race4.log"
+
+    - name: Test s2/snappy with downloaded snappy corpus
+      if: ${{ inputs.test-filter == '' }}
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -v ./s2/ ./snappy/ -args -download 2>&1 | tee "$RUNNER_TEMP/corpus.log"
+
+    - name: Test summary and skipped tests
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        LOGS="full race1 race4 corpus"
+        summary() {
+          for n in $LOGS; do
+            f="$RUNNER_TEMP/$n.log"
+            [ -f "$f" ] || continue
+            echo "Go test summary ($n) - passed: $(grep -cE '^ *--- PASS' "$f"), failed: $(grep -cE '^ *--- FAIL' "$f"), skipped: $(grep -cE '^ *--- SKIP' "$f")"
+          done
+        }
+        summary
+        passlist="$RUNNER_TEMP/passed-names.txt"
+        fullskips="$RUNNER_TEMP/full-skips.txt"
+        : > "$fullskips"
+        : > "$passlist"
+        for x in full corpus; do
+          if [ -f "$RUNNER_TEMP/$x.log" ]; then
+            awk '/^ *--- PASS: / { print $3 }' "$RUNNER_TEMP/$x.log" >> "$passlist"
+          fi
+        done
+        for n in full corpus race1 race4; do
+          f="$RUNNER_TEMP/$n.log"
+          [ -s "$f" ] || continue
+          echo "Skipped tests ($n) with reasons:"
+          awk -v step="$n" '
+            FILENAME == ARGV[1] { pass[$1] = 1; next }
+            FILENAME == ARGV[2] { i = index($0, " -- reason: "); if (i > 0) { nm = substr($0, 1, i - 1); sub(/^ *SKIPPED: /, "", nm); fskip[nm] = substr($0, i + 12) } next }
+            /^=== (RUN|NAME|CONT|PAUSE) / { cur = $3; next }
+            /^ +--- SKIP: / || /^--- SKIP: / {
+              name = $3
+              if (name in msg) {
+                r = msg[name]
+              } else {
+                r = "bare t.SkipNow() behind the test source own testing.Short()/isRaceTest guard (fires only under -short or -race)"
+                if (step ~ /^race/ && (name in pass)) r = r "; this test RAN AND PASSED in the non-short Test/corpus step on this leg"
+                else if (step ~ /^race/ && (name in fskip)) r = r "; in the non-short Test step it skipped with: " fskip[name]
+              }
+              if (r ~ /silesia|enwik9/ && r !~ /\[external/) r = r " [external 200MB-1GB benchmark corpus, not in the repo and never supplied by upstream CI]"
+              if (r ~ /zstd-10kfiles|extended dict test/ && r !~ /\[corpus/) r = r " [corpus only published on files.klauspost.com, whose DNS name no longer resolves]"
+              if (r ~ /github_users_sample_set/ && r !~ /\[corpus/) r = r " [corpus not in the repo and the source names no download URL for it]"
+              if (r ~ /-download flag/ && step != "corpus") r = r " [these tests run with -download in the corpus step]"
+              printf "  SKIPPED: %s -- reason: %s\n", name, r
+              next
+            }
+            /^ +[A-Za-z0-9_]+\.go:[0-9]+: / { if (cur != "") { m = $0; sub(/^ +/, "", m); msg[cur] = m } }
+          ' "$passlist" "$fullskips" "$f" | tee -a "$RUNNER_TEMP/skips-$n.txt"
+          if [ "$n" = full ]; then cp "$RUNNER_TEMP/skips-full.txt" "$fullskips"; fi
+        done
+        summary
 
   generate:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 30
     strategy:
       matrix:
         pkg: [s2, zstd, huff0]
@@ -75,6 +155,8 @@ jobs:
         test -z "$(git status --porcelain)"
 
   build-special:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -115,6 +197,8 @@ jobs:
       run: go test . -test.run=None;if [ $? -eq 0 ]; then go test ./s2/...; else true; fi
 
   fuzz-s2:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -141,6 +225,8 @@ jobs:
 
 
   fuzz-zstd:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -172,6 +258,8 @@ jobs:
         run: cd zstd&&go test -tags=${{ matrix.tags }} -run=none -fuzz=FuzzEncoding -fuzztime=250000x -test.fuzzminimizetime=10ms -fuzz-end=3&&cd ..
 
   fuzz-other:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -197,3 +285,57 @@ jobs:
 
       - name: fse/FuzzDecompress/${{ matrix.tags }}
         run: go test -tags=${{ matrix.tags }} -run=none -fuzz=FuzzDecompress -fuzztime=1000000x -test.fuzzminimizetime=10ms ./fse/.
+
+  module-zip:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5.3.0
+        with:
+          go-version: 1.24.x
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zipsrc /tmp/helper /tmp/modzip && mkdir -p /tmp/zipsrc /tmp/helper /tmp/modzip
+          tar -c --exclude=./.git -C "$GITHUB_WORKSPACE" . | tar -x -C /tmp/zipsrc
+          test ! -e /tmp/zipsrc/.git && test -f /tmp/zipsrc/go.mod
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[3]); err != nil {
+                  panic(err)
+              }
+          }
+          GOEOF
+          go run . github.com/klauspost/compress v1.18.0 /tmp/zipsrc /tmp/modzip/v1.18.0.zip
+          unzip -Z1 /tmp/modzip/v1.18.0.zip | wc -l
+          ls -l /tmp/modzip/v1.18.0.zip
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/modzip/v1.18.0.zip
+          if-no-files-found: error

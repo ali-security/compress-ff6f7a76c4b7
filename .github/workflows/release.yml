@@ -1,9 +1,7 @@
 name: goreleaser
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write # for goreleaser/goreleaser-action to create a GitHub release
